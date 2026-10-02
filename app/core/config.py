@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     database_url: str = (
         "postgresql+asyncpg://postgres:postgres@localhost:5432/soc_assistant"
     )
+    test_database_url: str | None = None
 
     model_config = SettingsConfigDict(
         env_file=".env",
