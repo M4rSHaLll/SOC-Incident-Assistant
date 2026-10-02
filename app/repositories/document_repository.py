@@ -1,0 +1,31 @@
+"""Document persistence without transaction ownership."""
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.document import Document
+from app.schemas.document import DocumentCreate
+
+
+class DocumentRepository:
+    async def create(self, session: AsyncSession, data: DocumentCreate) -> Document:
+        document = Document(**data.model_dump())
+        session.add(document)
+        await session.flush()
+        return document
+
+    async def get_by_id(
+        self, session: AsyncSession, document_id: int
+    ) -> Document | None:
+        result = await session.execute(
+            select(Document).where(Document.id == document_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def list(
+        self, session: AsyncSession, limit: int, offset: int
+    ) -> list[Document]:
+        result = await session.execute(
+            select(Document).order_by(Document.id).limit(limit).offset(offset)
+        )
+        return list(result.scalars().all())
