@@ -1,15 +1,21 @@
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.dependencies import get_embedding_service
 from app.api.documents import get_document_service
+from app.db.database import get_db_session
 from app.main import create_app
 from app.models.document import Document
+from app.repositories.document_repository import DocumentRepository
 from app.schemas.document import DocumentCreate
 from app.services.document_service import DocumentNotFoundError, DocumentService
+
+pytestmark = pytest.mark.usefixtures("fake_embedding_model")
 
 
 @pytest.fixture
@@ -179,3 +185,51 @@ def test_get_document_rejects_invalid_id(
 
     assert response.status_code == 422
     service.get_document.assert_not_awaited()
+
+
+def test_create_document_generates_embedding(
+    fake_embedding_service: AsyncMock,
+    document: Document,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = create_app()
+    session = AsyncSession()
+    persist = AsyncMock(return_value=document)
+    monkeypatch.setattr(DocumentRepository, "create", persist)
+
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        async with session:
+            yield session
+
+    app.dependency_overrides[get_db_session] = override_session
+    app.dependency_overrides[get_embedding_service] = lambda: fake_embedding_service
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/documents",
+            json={"title": "Phishing playbook", "content": "Keep evidence."},
+        )
+
+    assert response.status_code == 201
+    assert "embedding" not in response.json()
+    fake_embedding_service.embed_text.assert_awaited_once_with("Keep evidence.")
+    persist.assert_awaited_once_with(
+        session,
+        DocumentCreate(title="Phishing playbook", content="Keep evidence."),
+        fake_embedding_service.embed_text.return_value,
+    )
+    assert not session.in_transaction()
+
+
+@pytest.mark.anyio
+async def test_embedding_failure_does_not_persist(
+    fake_embedding_service: AsyncMock,
+) -> None:
+    fake_embedding_service.embed_text.side_effect = ValueError("Invalid embedding")
+    repository = AsyncMock(spec=DocumentRepository)
+    async with AsyncSession() as session:
+        service = DocumentService(session, repository, fake_embedding_service)
+        with pytest.raises(ValueError, match="Invalid embedding"):
+            await service.create_document(DocumentCreate(title="Title", content="Text"))
+        repository.create.assert_not_awaited()
+        assert not session.in_transaction()

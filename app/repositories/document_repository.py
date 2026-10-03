@@ -1,5 +1,7 @@
 """Document persistence without transaction ownership."""
 
+from __future__ import annotations
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -8,8 +10,10 @@ from app.schemas.document import DocumentCreate
 
 
 class DocumentRepository:
-    async def create(self, session: AsyncSession, data: DocumentCreate) -> Document:
-        document = Document(**data.model_dump())
+    async def create(
+        self, session: AsyncSession, data: DocumentCreate, embedding: list[float]
+    ) -> Document:
+        document = Document(**data.model_dump(), embedding=embedding)
         session.add(document)
         await session.flush()
         return document
@@ -29,3 +33,15 @@ class DocumentRepository:
             select(Document).order_by(Document.id).limit(limit).offset(offset)
         )
         return list(result.scalars().all())
+
+    async def search_similar(
+        self, session: AsyncSession, query_embedding: list[float], limit: int
+    ) -> list[tuple[Document, float]]:
+        distance = Document.embedding.cosine_distance(query_embedding).label("distance")
+        result = await session.execute(
+            select(Document, distance)
+            .where(Document.embedding.is_not(None))
+            .order_by(distance, Document.id)
+            .limit(limit)
+        )
+        return [(document, float(distance)) for document, distance in result.all()]

@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.document import Document
 from app.repositories.document_repository import DocumentRepository
 from app.schemas.document import DocumentCreate
+from app.services.embedding_service import EmbeddingService
 
 
 class DocumentNotFoundError(Exception):
@@ -14,14 +15,19 @@ class DocumentNotFoundError(Exception):
 
 class DocumentService:
     def __init__(
-        self, session: AsyncSession, repository: DocumentRepository
+        self,
+        session: AsyncSession,
+        repository: DocumentRepository,
+        embedding_service: EmbeddingService,
     ) -> None:
         self.session = session
         self.repository = repository
+        self.embedding_service = embedding_service
 
     async def create_document(self, data: DocumentCreate) -> Document:
+        embedding = await self.embedding_service.embed_text(data.content)
         async with self.session.begin():
-            document = await self.repository.create(self.session, data)
+            document = await self.repository.create(self.session, data, embedding)
         return document
 
     async def get_document(self, document_id: int) -> Document:
