@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import builtins
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import Label
 
 from app.models.document import Document
 from app.schemas.document import DocumentCreate
@@ -35,9 +38,11 @@ class DocumentRepository:
         return list(result.scalars().all())
 
     async def search_similar(
-        self, session: AsyncSession, query_embedding: list[float], limit: int
-    ) -> list[tuple[Document, float]]:
-        distance = Document.embedding.cosine_distance(query_embedding).label("distance")
+        self, session: AsyncSession, query_embedding: builtins.list[float], limit: int
+    ) -> builtins.list[tuple[Document, float]]:
+        distance: Label[float] = Document.embedding.cosine_distance(
+            query_embedding
+        ).label("distance")
         result = await session.execute(
             select(Document, distance)
             .where(Document.embedding.is_not(None))

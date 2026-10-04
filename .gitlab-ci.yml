@@ -1,0 +1,46 @@
+default:
+  image: python:3.12-slim
+  cache:
+    key: "pip-python312"
+    paths:
+      - .cache/pip/
+  before_script:
+    - python -m pip install '.[dev]'
+
+stages:
+  - lint
+  - test
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  APP_ENV: test
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+
+lint:
+  stage: lint
+  script:
+    - python -m ruff check .
+    - python -m mypy app
+
+unit:
+  stage: test
+  script:
+    - python -m pytest -m "not integration" -v
+
+integration:
+  stage: test
+  services:
+    - name: pgvector/pgvector:pg17
+      alias: postgres
+  variables:
+    # Disposable CI database credentials, not production secrets.
+    POSTGRES_DB: soc_assistant_test
+    POSTGRES_USER: postgres
+    POSTGRES_PASSWORD: postgres
+    DATABASE_URL: "postgresql+asyncpg://postgres:postgres@postgres:5432/soc_assistant"
+    TEST_DATABASE_URL: "postgresql+asyncpg://postgres:postgres@postgres:5432/soc_assistant_test"
+  script:
+    # Override only for Alembic: tests protect against using the application DB.
+    - DATABASE_URL="$TEST_DATABASE_URL" python -m alembic upgrade head
+    - python -m pytest -m integration -v

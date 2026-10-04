@@ -1,451 +1,205 @@
 # SOC Incident Assistant
 
-Pet-проект для портфолио на позицию Machine Learning Technology Engineer.
-Текущее состояние: **RAG incident analysis** — документы knowledge base, локальные
-embeddings, semantic search и структурированный анализ через совместимый LLM API.
+RAG backend для помощи SOC-аналитику при анализе security incidents. Приложение
+хранит справочные документы, находит близкие по смыслу материалы и передаёт
+отобранный контекст OpenAI-compatible LLM для структурированного анализа.
 
-Стек: Python >=3.12, FastAPI, Pydantic v2 / pydantic-settings,
-SQLAlchemy 2.x (async API), asyncpg, PostgreSQL, Alembic, pgvector,
-Sentence Transformers, httpx для async LLM HTTP-запросов.
-Docker-образ использует Python 3.12.
+Portfolio project для позиции Machine Learning Technology Engineer.
+Текущий этап: RAG API с проверками типов, GitHub Actions / GitLab CI и базовой эксплуатационной
+диагностикой. Результат анализа требует проверки специалистом.
 
-## Требования
+## Features
 
-- Python >=3.12 и pip для локального запуска.
-- PostgreSQL 17 с pgvector; Compose использует `pgvector/pgvector:pg17`.
-- Docker с Compose для запуска контейнеров.
-- Доступ к Hugging Face при первой загрузке модели и место для PyTorch/model cache.
+- Async FastAPI REST API для документов, поиска и анализа инцидентов.
+- PostgreSQL, async SQLAlchemy и явные Alembic migrations.
+- Sentence Transformer embeddings и semantic search через pgvector.
+- RAG retrieval, ограничение контекста и проверка structured incident analysis через Pydantic.
+- OpenAI-compatible LLM integration через `httpx.AsyncClient`.
+- Liveness, database readiness, request ID и логи запросов.
+- Unit/API и PostgreSQL integration tests, Ruff и mypy.
+- Docker Compose, non-root API image, GitHub Actions и GitLab CI configuration.
 
-## Конфигурация
+## Architecture
 
-При необходимости скопируйте `.env.example` в `.env`. Переменные окружения имеют
-приоритет над `.env`, который читается из текущей рабочей директории.
+```text
+Client
+  |
+FastAPI (request ID / request logging)
+  |
+  +-- Documents API --> DocumentService --> DocumentRepository
+  |                         +-- EmbeddingService
+  |
+  +-- Search API ----> SearchService ------> pgvector retrieval
+  |                         +-- EmbeddingService
+  |
+  +-- Analyze API ---> AnalysisService
+  |                         +-- EmbeddingService
+  |                         +-- pgvector retrieval
+  |                         +-- Prompt Builder
+  |                         +-- LLMService --> external provider
+  |
+  +-- /health (liveness)
+  +-- /ready  (SELECT 1 through the existing session factory)
 
-| Переменная | Значение по умолчанию | Назначение |
+DocumentRepository --> AsyncSession --> PostgreSQL + pgvector
+```
+
+API отвечает за HTTP и dependency wiring; service — за сценарий работы;
+repository — за SQL. Repository вызывает `flush`, а транзакцией записи владеет
+service (`session.begin()`). Embedding создаётся до начала транзакции записи.
+Сессии используют `expire_on_commit=False`.
+
+Engine, session factory, одна embedding model и один HTTP client создаются внутри
+FastAPI lifespan. Session factory и сервисы сохраняются в `app.state`.
+При shutdown закрывается HTTP client и освобождается engine, даже если закрытие
+клиента завершилось ошибкой. При ошибке загрузки модели engine также освобождается.
+
+## RAG flow
+
+```text
+incident -> embedding -> top-k semantic search -> grounded prompt
+         -> LLM -> validated structured response + application-owned sources
+```
+
+Поиск исключает legacy `NULL` embeddings, сортирует по cosine distance
+(при равенстве — по ID), возвращает `similarity = 1 - distance`.
+Контекст ограничен `RAG_MAX_CONTEXT_CHARS`; последний документ может обрезаться.
+`sources` включает только документы, реально попавшие в prompt.
+Без доступного контекста API возвращает 409 и не вызывает LLM.
+
+Incident и документы обозначены в prompt как недоверенные данные. Ответ LLM
+должен соответствовать JSON schema: `summary`, `severity`, `likely_attack_type`,
+`recommended_actions`. Приложение добавляет `sources`: ID, title, category и similarity.
+Модель не определяет список источников.
+
+## Tech stack
+
+Python 3.12 (пакет допускает >=3.12), FastAPI, Pydantic / pydantic-settings,
+SQLAlchemy async, asyncpg, PostgreSQL 17, Alembic, pgvector,
+Sentence Transformers (`all-MiniLM-L6-v2`, 384 dimensions), httpx,
+pytest / AnyIO, Ruff, mypy, Docker Compose, GitHub Actions, GitLab CI.
+
+## API
+
+| Method | Path | Назначение |
 | --- | --- | --- |
-| `APP_NAME` | `SOC Incident Assistant` | Название в OpenAPI |
-| `APP_ENV` | `development` | `development`, `test` или `production`; пока не переключает поведение |
-| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` или `CRITICAL`; пока не применяется к logging |
-| `DATABASE_URL` | `postgresql+asyncpg://postgres:postgres@127.0.0.1:55432/soc_assistant` | URL PostgreSQL для asyncpg при запуске с хоста |
-| `TEST_DATABASE_URL` | Не задан | URL отдельной мигрированной PostgreSQL БД для integration tests |
-| `EMBEDDING_MODEL_NAME` | `sentence-transformers/all-MiniLM-L6-v2` | Модель для документов и запросов |
-| `EMBEDDING_DIMENSION` | `384` | Должна совпадать с моделью и схемой `VECTOR(384)` |
-| `LLM_BASE_URL` | `https://api.openai.com/v1` | Base URL OpenAI-compatible Chat Completions API, включая `/v1` |
-| `LLM_API_KEY` | Не задан | Bearer API key; нужен только для анализа через LLM |
-| `LLM_MODEL` | `gpt-4.1-mini` | Имя модели у выбранного провайдера |
-| `LLM_TIMEOUT_SECONDS` | `30` | Положительное значение HTTP timeout |
-| `RAG_MAX_CONTEXT_CHARS` | `12000` | Максимум символов knowledge context, включая заголовки документов |
+| GET | `/health` | 200 `{"status":"ok"}`; без проверки зависимостей |
+| GET | `/ready` | PostgreSQL `SELECT 1`: 200 `{"status":"ready"}` или 503 `{"status":"not_ready"}` |
+| POST | `/api/v1/documents` | Создать документ и embedding, ответ 201 |
+| GET | `/api/v1/documents` | Список с `limit` (1–100) и `offset` |
+| GET | `/api/v1/documents/{id}` | Получить документ |
+| POST | `/api/v1/search` | Semantic search: `query`, `limit` (1–20, default 5) |
+| POST | `/api/v1/analyze` | RAG: `incident` (10–10000 символов), `top_k` (1–10, default 5) |
 
-Значения `postgres:postgres` предназначены только для локальной разработки.
-Реальные credentials задавайте через окружение, не сохраняйте их в Git.
-Адрес подключения зависит от места запуска:
+OpenAPI UI: [localhost:8000/docs](http://127.0.0.1:8000/docs).
+Каждый ответ получает `X-Request-ID`: входное значение либо новый UUID.
+Readiness использует существующую DB session; probe ограничен тремя секундами.
+Он проверяет доступность БД, но не наличие миграций, inference или LLM provider.
 
-| Сценарий | Адрес PostgreSQL | DATABASE_URL |
-| --- | --- | --- |
-| Python / Alembic на хосте | `127.0.0.1:55432` | `postgresql+asyncpg://postgres:postgres@127.0.0.1:55432/soc_assistant` |
-| API внутри Docker Compose | `postgres:5432` | `postgresql+asyncpg://postgres:postgres@postgres:5432/soc_assistant` |
+Известные application errors имеют тело `{"detail":"..."}`:
+404 — документ отсутствует; 409 — нет RAG context; 502 — timeout, connection error,
+non-2xx или неверный ответ LLM; 503 — LLM не настроен; 422 — request validation.
+Readiness 503 использует указанное выше тело `status`.
+Неожиданная ошибка возвращает 500 с общим сообщением без внутренних diagnostics.
 
-Default в Settings и `.env.example` рассчитаны на локальный запуск с хоста.
-Compose передаёт API собственный URL через environment: контейнеры используют
-Docker network и внутренний порт 5432. Публикация порта остаётся `55432:5432`.
-Уровень серверных логов Uvicorn
-настраивается отдельно параметром `--log-level`.
-
-Embeddings и retrieval работают локально. Для `/analyze` задайте LLM provider
-и API key в окружении или локальном `.env` (он игнорируется Git). Пустой ключ не
-мешает запуску API, созданию документов и `/search`; при попытке вызвать LLM
-анализ вернёт 503. После изменения LLM settings перезапустите API.
-Incident и отобранные фрагменты документов отправляются настроенному провайдеру.
-
-## Запуск через Docker Compose
-
-Из корня репозитория:
+Примеры для POSIX shell (в Windows также можно использовать OpenAPI UI):
 
 ```sh
-docker compose up --build -d
-docker compose exec api python -m alembic upgrade head
+curl -i http://127.0.0.1:8000/health
+curl -i http://127.0.0.1:8000/ready
+curl -X POST http://127.0.0.1:8000/api/v1/documents \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"SSH triage","content":"Review successful logins after repeated SSH failures. Preserve authentication logs.","category":"credential_access"}'
+curl -X POST http://127.0.0.1:8000/api/v1/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"multiple failed SSH login attempts","limit":5}'
 ```
 
-API доступен на порту 8000, PostgreSQL — на host-порту 55432. API запускается после
-успешного healthcheck PostgreSQL. Данные сохраняются в именованном Docker volume.
-
-Модель загружается при startup API, а не при Docker build. Первый запуск требует
-сети и может быть долгим; до завершения startup API не обслуживает запросы.
-Каждый процесс Uvicorn владеет своей моделью. Hugging Face использует свой cache
-(путь можно переопределить через `HF_HOME`); модель не включается в образ.
-
-Существующий volume автоматически не удаляется. Если volume от обычного postgres
-image несовместим с новым окружением, может потребоваться его ручное пересоздание
-после резервного копирования. Это удаляет локальные данные; не выполняйте очистку
-volume как обычный шаг обновления.
-
-**Миграции выполняются явно, отдельно от старта API.** Приложение не создаёт
-таблицы при старте. До применения миграций `/health` отвечает, но запросы
-к documents завершаются ошибкой БД. Отдельного migration container нет.
-
-## Database migrations
-
-В активированном локальном Python окружении с установленным проектом выполните
-из корня репозитория:
+Ручной вызов после настройки provider/key и перезапуска API:
 
 ```sh
-docker compose up -d postgres
-alembic upgrade head
-alembic current
+curl -X POST http://127.0.0.1:8000/api/v1/analyze \
+  -H 'Content-Type: application/json' \
+  -d '{"incident":"80 failed SSH login attempts for the same account in 10 minutes.","top_k":5}'
 ```
 
-Alembic использует `Settings().database_url`: тот же `DATABASE_URL` из окружения
-или `.env`, что и приложение. При запуске Alembic с хоста адрес — `127.0.0.1:55432`.
-Credentials в `alembic.ini` не хранятся. `app.main` не импортируется:
-Alembic создаёт собственный async engine вне lifespan и вызывает `run_sync`.
-Metadata берётся из существующего `Base`, модель `Document` импортируется явно.
+Этот вызов отправляет incident и выбранный контекст внешнему провайдеру и может
+быть платным. Тесты и CI реальных LLM-запросов не выполняют.
 
-Revision `0001` создаёт `documents` и не изменена. Revision `0002` включает
-extension `vector`, добавляет `embedding VECTOR(384)` и ограничение новых записей.
-Пользователь БД для миграций должен иметь право устанавливать extension.
-Проверка после миграции:
+## Local development
 
-```sh
-docker compose exec postgres psql -U postgres -d soc_assistant -c "SELECT extname FROM pg_extension WHERE extname = 'vector';"
-```
-
-Команда отката одного шага:
-
-```sh
-alembic downgrade -1
-```
-
-С `0002` это удаляет embedding column и её CHECK, сохраняя документы. Extension
-`vector` остаётся, поскольку им могут пользоваться другие таблицы.
-`alembic downgrade base` удаляет таблицу documents вместе с данными.
-После учебной проверки отката
-выполните `alembic upgrade head`, прежде чем запускать API.
-Любую команду `alembic ...` можно записать как `python -m alembic ...`.
-
-Если таблица была создана вручную на предыдущем этапе, `upgrade head` не будет
-автоматически принимать её под управление. Сначала проверьте полное соответствие
-существующей схемы revision `0001`; только для уже соответствующей схемы можно
-выполнить `alembic stamp 0001`. Эта команда записывает версию, но не изменяет схему.
-Не удаляйте существующие данные ради первоначального запуска миграций.
-
-## Локальный запуск API
-
-Создайте виртуальное окружение из корня репозитория:
+Нужны Python 3.12, pip и PostgreSQL с pgvector (удобно через Docker Compose).
+При первой загрузке embedding model нужны доступ к Hugging Face и место для cache.
 
 ```sh
 python -m venv .venv
-```
-
-PowerShell:
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
-
-Linux/macOS:
-
-```sh
+# Linux/macOS:
 source .venv/bin/activate
-```
-
-Установите приложение и зависимости разработки:
-
-```sh
-python -m pip install -e ".[dev]"
-```
-
-Запустите только PostgreSQL, если ещё не используете собственную БД:
-
-```sh
+# PowerShell вместо предыдущей команды:
+# .\.venv\Scripts\Activate.ps1
+python -m pip install -e '.[dev]'
+cp .env.example .env
+# PowerShell: Copy-Item .env.example .env
 docker compose up -d postgres
+python -m alembic upgrade head
+python -m uvicorn app.main:app --reload --no-access-log
 ```
 
-Задайте `DATABASE_URL` в окружении или `.env`, примените миграции и запустите API
-(порт 8000 должен быть свободен):
+Команды выполняются из корня репозитория. API обслуживает запросы после загрузки
+модели. Каждый процесс Uvicorn владеет отдельной моделью. `/health`, документы
+и поиск не требуют LLM key. При `/analyze` отсутствие контекста даёт 409;
+если контекст найден, отсутствие ключа даёт controlled 503.
 
-```sh
-alembic upgrade head
-python -m uvicorn app.main:app --reload --port 8000
-```
-
-Документация: [Swagger UI](http://127.0.0.1:8000/docs).
-
-## Endpoints
-
-| Метод | Путь | Результат |
+| Сценарий | Адрес PostgreSQL | DATABASE_URL |
 | --- | --- | --- |
-| GET | `/health` | 200, `{"status":"ok"}`; доступность БД не проверяет |
-| POST | `/api/v1/documents` | 201, созданный документ |
-| GET | `/api/v1/documents?limit=20&offset=0` | 200, список документов по возрастанию ID |
-| GET | `/api/v1/documents/{document_id}` | 200, документ; 404, если не найден |
-| POST | `/api/v1/search` | 200, query и top-k документов с similarity |
-| POST | `/api/v1/analyze` | 200, структурированный SOC analysis и source metadata |
+| Local Python / Alembic с хоста | `127.0.0.1:55432` | `postgresql+asyncpg://postgres:postgres@127.0.0.1:55432/soc_assistant` |
+| API внутри Docker Compose | `postgres:5432` | `postgresql+asyncpg://postgres:postgres@postgres:5432/soc_assistant` |
 
-`title`: 1–255 символов после удаления пробелов по краям.
-`content`: непустой текст после удаления пробельных символов по краям;
-форматирование внутри текста сохраняется.
-`category`: необязательная строка до 100 символов либо `null`.
-`limit`: 1–100, по умолчанию 20; `offset`: от 0, по умолчанию 0.
-ID должен быть положительным целым числом. Некорректный запрос получает 422.
-Обновление и удаление документов в этот этап не входят.
+Compose публикует `55432:5432`. Default Settings и `.env.example` рассчитаны на хост;
+Compose передаёт API собственный URL для Docker network.
 
-Пример POST в shell Linux/macOS:
+## Migrations
 
 ```sh
-curl -i -X POST http://127.0.0.1:8000/api/v1/documents \
-  -H 'Content-Type: application/json' \
-  -d '{"title":"Phishing playbook","content":"Inspect the sender and attachments.","category":"phishing"}'
+python -m alembic upgrade head
+python -m alembic current
 ```
 
-То же в PowerShell:
+Ожидаемый head — `0002`. Alembic читает `Settings().database_url`; приложение
+не создаёт таблицы и не запускает миграции автоматически. `/ready` не подтверждает
+актуальность схемы. Пользователю миграций нужны права на создание extension `vector`.
 
-```powershell
-$body = @{ title = 'Phishing playbook'; content = 'Inspect the sender and attachments.'; category = 'phishing' } | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/v1/documents -ContentType 'application/json' -Body $body
-```
+`0001` создаёт documents; `0002` добавляет `VECTOR(384)` и
+`CHECK (embedding IS NOT NULL) NOT VALID`. Старые строки сохраняют `NULL` и
+исключаются из поиска; новые и изменяемые строки должны иметь embedding.
+Для legacy документов нужен отдельный ручной backfill той же моделью:
+прочитать строки с `NULL`, вычислить вектор вне транзакции записи, сохранить его
+в короткой транзакции. Автоматический backfill не реализован.
+Не меняйте модель для существующего набора векторов без пересчёта embeddings.
 
-Ответ содержит `id`, `title`, `content`, `category`, `created_at`.
-`created_at` заполняется PostgreSQL и включает часовой пояс.
-Для GET используйте ID из ответа POST:
-
-```sh
-curl -i http://127.0.0.1:8000/api/v1/documents/1
-curl -i 'http://127.0.0.1:8000/api/v1/documents?limit=20&offset=0'
-curl -i http://127.0.0.1:8000/health
-```
-
-В PowerShell вместо `curl` можно использовать `curl.exe`.
-
-## Semantic search
-
-При создании документа: `content → SentenceTransformer → 384-dimensional embedding
-→ pgvector`. Вектор вычисляется до начала транзакции записи; при ошибке модели
-документ не сохраняется. GET/POST documents не возвращают embedding в HTTP response.
-
-При поиске: `query → embedding → cosine distance → top-k documents`.
-Repository использует SQLAlchemy `cosine_distance`, исключает старые строки с
-NULL embedding и сортирует по возрастанию distance (при равенстве — по ID).
-SearchService возвращает `similarity = 1 - cosine_distance`: выше — ближе.
-Cosine similarity лежит примерно в диапазоне [-1, 1]; это не вероятность.
-Поиск точный, без HNSW/IVFFlat и без порога релевантности.
-
-```sh
-curl -i -X POST http://127.0.0.1:8000/api/v1/search \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"multiple failed ssh login attempts","limit":5}'
-```
-
-PowerShell:
-
-```powershell
-$body = @{ query = 'multiple failed ssh login attempts'; limit = 5 } | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/v1/search -ContentType 'application/json' -Body $body
-```
-
-Ответ: `{"query":"...","results":[{"document_id":1,"title":"...","content":"...",
-"category":"...","similarity":0.87}]}`. Если подходящих записей нет в БД, results —
-пустой список. Query обрезается по краям и не может быть пустой; limit — 1–20,
-default 5. Некорректные значения получают 422.
-
-Используется [all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)
-с собственной размерностью 384. EmbeddingService проверяет размерность при
-загрузке модели и каждого результата; нулевые и нечисловые/бесконечные векторы
-отклоняются. Загрузка и `encode()` выполняются через `asyncio.to_thread` на CPU.
-Модель создаётся один раз в lifespan и доступна через `app.state` / Depends.
-На import модель не создаётся. SQLAlchemy VECTOR сам сериализует векторы;
-дополнительный asyncpg registration для одиночной VECTOR-колонки не нужен.
-
-На этом этапе один документ получает один вектор: длинный текст обрезается
-по token limit модели, chunking отсутствует. При замене модели даже с той же
-размерностью нужно пересчитать все векторы; другая размерность требует отдельной
-миграции. Произвольное изменение EMBEDDING_DIMENSION при текущей схеме отклоняется.
-
-## Архитектура и транзакции
-
-- `app/main.py` — фабрика приложения, routers, lifespan для engine и session factory.
-- `app/api/documents.py` — HTTP-контракты, Depends и преобразование domain error в 404.
-- `app/schemas/document.py` — валидация запросов и сериализация ORM через `from_attributes`.
-- `app/services/document_service.py` — сценарии, ошибка отсутствующего документа и транзакции.
-- `app/repositories/document_repository.py` — запросы SQLAlchemy без HTTP-логики и commit.
-- `app/models/document.py` — ORM-модель.
-- `app/db/database.py` — DeclarativeBase, async engine, async_sessionmaker, сессия на запрос.
-- `app/services/embedding_service.py` — lifecycle модели и кодирование текста.
-- `app/services/search_service.py` — query embedding и преобразование distance в similarity.
-- `app/api/search.py`, `app/schemas/search.py` — контракт semantic search.
-- `app/services/analysis_service.py` — retrieval → prompt → LLM → response с sources.
-- `app/services/prompt_builder.py` — инструкции и ограниченный knowledge context.
-- `app/services/llm_service.py` — async HTTP, обработка ошибок и проверка JSON.
-- `app/api/analysis.py`, `app/schemas/analysis.py` — контракт анализа инцидента.
-
-Service создаёт документ внутри `async with session.begin()`: успешный выход
-делает commit, исключение приводит к rollback. Repository использует `flush`,
-чтобы получить ID и серверный `created_at` до commit. `expire_on_commit=False`
-позволяет сериализовать результат без дополнительного запроса после commit.
-Сессия закрывается после запроса; engine освобождает пул при остановке приложения.
-Создание engine не открывает соединение: `/health` и API-тесты с подменённым service
-работают без запущенной БД; в тестах модель также подменена. На реальном startup
-модель должна успешно загрузиться. Глобальных engine/session/service singleton нет.
-
-`sqlalchemy[asyncio]` включает `greenlet`, необходимый для async API SQLAlchemy.
-Отдельный DI framework и базовые CRUD/service/repository классы не используются.
-
-В lifespan после загрузки embedding-модели создаётся один `httpx.AsyncClient` и
-`LLMService`, доступный через `app.state` / Depends. HTTP client закрывается через
-`aclose()` перед освобождением engine; вложенные `finally` обеспечивают освобождение
-БД также при ошибке startup или закрытия HTTP client. HTTP client не создаётся
-на import или заново на каждый запрос. Глобальная logging configuration не меняется.
-
-## RAG incident analysis
-
-```text
-Incident → EmbeddingService → pgvector retrieval → top-k context
-         → LLMService / Chat Completions → validated SOC analysis + sources
-```
-
-AnalysisService напрямую использует EmbeddingService и DocumentRepository;
-SearchService для этого не вызывается. Схема БД не менялась, Alembic head — `0002`.
-
-Запрос к провайдеру: `POST {LLM_BASE_URL}/chat/completions`, Bearer Authorization,
-configured `model`, сообщения `system` / `user`, `response_format={"type":"json_object"}`.
-Провайдер должен поддерживать этот JSON mode и стандартный ответ
-`choices[0].message.content` с `finish_reason="stop"`.
-Нестандартный или обрезанный ответ отклоняется; retry и repair prompts отсутствуют.
-
-System prompt требует использовать только incident facts и предоставленный context,
-указывать uncertainty, не выдумывать IOC/CVE/IP/domain/user/malware и возвращать
-только JSON. Knowledge base и incident явно помечены как untrusted data;
-инструкции внутри документов запрещено выполнять. Это базовая защита в prompt,
-а не гарантия отсутствия prompt injection или фактических ошибок модели.
-
-User prompt содержит incident, документы с заголовками `[Document ID]`, title,
-category и content, затем инструкции для SOC-анализа. Векторы не передаются.
-Документы добавляются по relevance; учитываются заголовки и разделители.
-Последний content обрезается по символам с `[truncated]`, если маркер помещается.
-`RAG_MAX_CONTEXT_CHARS` ограничивает именно reference context; incident ограничен
-отдельно 10000 символами, system prompt не входит в этот бюджет. Это не token limit.
-
-Sources строит приложение из документов, чей content реально попал в prompt,
-в порядке retrieval. Они содержат только ID/title/category/similarity.
-LLM не может добавить свои sources: дополнительные поля в его JSON запрещены.
-Similarity вычисляется как `1 - cosine_distance`, это не confidence оценки LLM.
-
-Запрос: incident после strip — 10–10000 символов, top_k — 1–10 (default 5).
-
-```sh
-curl -i -X POST http://127.0.0.1:8000/api/v1/analyze \
-  -H 'Content-Type: application/json' \
-  -d '{"incident":"During the last 10 minutes the same account generated 80 failed SSH login attempts from multiple external IP addresses.","top_k":5}'
-```
-
-Иллюстрация структуры ответа (текст и similarity зависят от данных и модели):
-
-```json
-{
-  "summary": "Repeated SSH authentication failures require investigation; compromise is not confirmed.",
-  "severity": "high",
-  "likely_attack_type": "Possible SSH brute-force attack",
-  "recommended_actions": ["Review successful authentication events for the account."],
-  "sources": [
-    {"document_id": 3, "title": "SSH response", "category": "credential_access", "similarity": 0.86}
-  ]
-}
-```
-
-LLM JSON проверяется Pydantic: непустые summary/likely_attack_type/actions,
-не менее одного action, severity только `low|medium|high|critical`.
-Полный content источников в AnalyzeResponse не возвращается.
-
-| Ситуация | HTTP | detail |
-| --- | --- | --- |
-| Некорректный incident/top_k | 422 | Ошибки Pydantic |
-| Нет usable context | 409 | `No relevant knowledge base documents are available` |
-| Ключ/конфигурация LLM отсутствует | 503 | `LLM provider is not configured` |
-| Timeout, connection error, non-2xx | 502 | `LLM provider request failed` |
-| Неверный provider/model JSON или schema | 502 | `LLM provider returned an invalid analysis` |
-
-Без context LLM не вызывается. Слишком маленький context budget, в который не
-помещается ни один документ с content, тоже даёт 409. Retrieval не имеет similarity
-threshold: наличие результатов не гарантирует релевантность. Ответ требует проверки
-SOC-аналитиком. В логах — начало/завершение анализа, число источников и тип ошибки;
-API key, Authorization, incident и полный provider response приложение не логирует.
-
-## Manual RAG smoke workflow
-
-1. Запустите БД: `docker compose up -d postgres`.
-2. В локальном Python окружении выполните `python -m alembic upgrade head`.
-3. Запустите `python -m uvicorn app.main:app --reload` и дождитесь загрузки embeddings.
-4. Добавьте несколько security documents.
-5. Проверьте `/search`.
-6. Задайте действующий `LLM_API_KEY` через окружение или локальный `.env`, при
-   необходимости настройте base URL/model; перезапустите API, чтобы прочитать settings.
-7. Явно выполните `/analyze`. Это реальный запрос к провайдеру и может быть платным.
-
-PowerShell, шаги 4–5:
-
-```powershell
-$documents = @(
-    @{ title = 'SSH response'; content = 'For repeated SSH login failures, review successful logins for the same account, preserve authentication logs and consider rate limiting.'; category = 'credential_access' },
-    @{ title = 'Phishing response'; content = 'Inspect suspicious sender addresses, preserve email headers and isolate unsafe attachments.'; category = 'phishing' }
-)
-foreach ($document in $documents) {
-    Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/v1/documents -ContentType 'application/json' -Body ($document | ConvertTo-Json)
-}
-$search = @{ query = 'multiple failed ssh login attempts'; limit = 5 } | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/v1/search -ContentType 'application/json' -Body $search
-```
-
-После настройки ключа и перезапуска API, шаг 7:
-
-```powershell
-$incident = @{ incident = 'During the last 10 minutes the same account generated 80 failed SSH login attempts from multiple external IP addresses.'; top_k = 5 } | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/v1/analyze -ContentType 'application/json' -Body $incident
-```
-
-Для API внутри Docker ключ нужно передать именно в контейнер: `.env` не копируется
-в image и текущий Compose автоматически не передаёт LLM settings. Например, после
-экспорта LLM variables в host environment и остановки обычного API service:
-
-```sh
-docker compose stop api
-docker compose run --rm --service-ports -e LLM_API_KEY -e LLM_BASE_URL -e LLM_MODEL -e LLM_TIMEOUT_SECONDS -e RAG_MAX_CONTEXT_CHARS api
-```
-
-При этом DATABASE_URL внутри API остаётся `postgres:5432`. Обычный pytest никогда
-не выполняет paid LLM calls, даже если в окружении задан ключ.
-
-## Проверки
+## Tests
 
 ```sh
 python -m pytest -v
+python -m pytest -m "not integration" -v
 python -m ruff check .
-docker compose config
+python -m mypy app
+git diff --check
 ```
 
-API-тесты подменяют `get_document_service` через `dependency_overrides`.
-Проверяются создание, чтение, список, 404, валидация тела и пагинации;
-внутренности SQLAlchemy не мокируются. Это не интеграционные тесты PostgreSQL:
-работа SQL-запросов и транзакций с реальной БД ими не проверяется.
-Unit/API-тесты подменяют model layer и embedding dependency и не скачивают модель.
-Также проверяются search response, distance → similarity, валидация query/limit,
-размерность embedding, вызов encode вне event loop и отсутствие записи при ошибке.
-LLM tests используют `httpx.MockTransport`: проверяют URL/auth/model/messages,
-HTTP-ошибки, timeout, JSON/schema и отсутствие утечки diagnostics. AnalysisService
-и API tests используют mocks/overrides; отдельно проверяется lifecycle ресурсов.
+Unit/API tests используют fake embeddings, dependency overrides и
+`httpx.MockTransport`. Они проверяют API, retrieval orchestration, prompt budget,
+JSON validation, public errors, LLM timeout, resource cleanup, Settings,
+readiness и request logging. Реальная модель не скачивается; ключ не нужен.
 
-## Integration tests
-
-Тесты в `tests/integration/` работают только с настоящим PostgreSQL и уже
-мигрированной отдельной БД. Создайте её один раз, например через Compose:
+Integration tests требуют отдельную предварительно мигрированную БД. Создайте
+её один раз, если она ещё не существует:
 
 ```sh
-docker compose up -d postgres
 docker compose exec postgres createdb -U postgres soc_assistant_test
 ```
 
-Если PostgreSQL работает вне Docker, используйте `createdb` с параметрами
-подключения вашего сервера. Создание БД не выполняется на каждый тест.
-
-Linux/macOS:
+POSIX shell:
 
 ```sh
 export TEST_DATABASE_URL='postgresql+asyncpg://postgres:postgres@127.0.0.1:55432/soc_assistant_test'
@@ -469,103 +223,147 @@ try {
 python -m pytest -m integration -v
 ```
 
-Alembic всегда читает `DATABASE_URL`, поэтому для миграции тестовой БД он
-переопределяется временно. Перед pytest нужно вернуть обычный `DATABASE_URL`.
-Сам `TEST_DATABASE_URL` никогда не меняет БД приложения или Alembic автоматически.
-Его также можно задать в локальном `.env`.
+Перед pytest обычный `DATABASE_URL` должен быть восстановлен. Тесты требуют
+имя БД с суффиксом `_test`, отличное от application database, и драйвер asyncpg.
+Без `TEST_DATABASE_URL` integration tests пропускаются; неверная конфигурация
+или недоступная явно заданная БД приводит к ошибке.
 
-Без `TEST_DATABASE_URL` integration tests пропускаются с понятной причиной,
-остальные тесты продолжают выполняться. Неверный URL, недоступная БД или
-отсутствующая таблица при заданном URL приводят к ошибке, а не скрытому skip.
-Для защиты тесты требуют драйвер `postgresql+asyncpg`, имя БД с суффиксом `_test`
-и имя, отличное от БД в `DATABASE_URL`. Fallback на development URL отсутствует.
+Используйте тестовую БД без сохранённых embedded documents и параллельных записей.
+Каждый тест работает во внешней транзакции с SAVEPOINT и rollback; данные не
+удаляются через DROP/TRUNCATE. Проверяются repository, транзакции, pgvector cosine
+ordering и RAG retrieval с fake LLM и детерминированными векторами размерности 384.
 
-Каждый тест открывает своё соединение и внешнюю транзакцию. `AsyncSession`
-использует `join_transaction_mode="create_savepoint"`: commit/rollback сессии
-работают внутри SAVEPOINT. После теста внешняя транзакция всегда откатывается,
-сессия и соединение закрываются, engine освобождается. Тесты не выполняют
-DROP/TRUNCATE и не создают таблицы. PostgreSQL sequence может продвинуться даже
-после rollback, поэтому тесты не предполагают последовательные ID без пропусков.
-Используйте отдельную БД без сохранённых embedded documents и без параллельных
-записей из других процессов. До тестов примените миграции до `0002`.
+## Docker
 
-Проверяются создание, чтение существующего/отсутствующего документа, сортировка
-и пагинация списка, откат записи при исключении, запрет записи без embedding,
-cosine distance / порядок / limit поиска с детерминированными векторами длины 384.
-Реальная модель в repository-тестах не используется. Async-тесты запускает pytest
-plugin AnyIO, уже установленный вместе с FastAPI/httpx; backend — `asyncio`.
-Дополнительный RAG integration test использует реальный pgvector retrieval и fake
-LLM: проверяет выбранный context и sources без Hugging Face или внешних LLM calls.
-
-## Existing documents / backfill
-
-`0002` добавляет nullable column: существующие документы сохраняются с NULL и
-пока не участвуют в поиске. `CHECK (embedding IS NOT NULL) NOT VALID` не проверяет
-старые строки, но запрещает новые/изменённые строки без embedding. Поэтому ORM
-честно допускает `None` для legacy rows. Новые документы API всегда имеют вектор.
-Фиктивные embeddings не создаются; NOT NULL для всей колонки пока не выставляется.
-
-Для маленького dev dataset запустите следующий Python-код из корня проекта
-в активированном окружении после `alembic upgrade head` (например, сохраните во
-временный скрипт). Он читает только NULL embeddings и использует ту же модель:
-
-```python
-import asyncio
-from sqlalchemy import select
-from app.core.config import Settings
-from app.db.database import create_database
-from app.models.document import Document
-from app.services.embedding_service import EmbeddingService
-
-async def backfill():
-    settings = Settings()
-    embeddings = EmbeddingService(settings.embedding_model_name, settings.embedding_dimension)
-    await embeddings.load_model()
-    engine, sessions = create_database(settings.database_url)
-    try:
-        async with sessions() as session:
-            rows = (await session.execute(
-                select(Document.id, Document.content).where(Document.embedding.is_(None))
-            )).all()
-        for document_id, content in rows:
-            vector = await embeddings.embed_text(content)
-            async with sessions.begin() as session:
-                document = await session.get(Document, document_id)
-                if document is not None and document.embedding is None:
-                    document.embedding = vector
-    finally:
-        await engine.dispose()
-
-asyncio.run(backfill())
+```sh
+docker compose config
+docker compose build api
+docker compose up -d
+docker compose exec api python -m alembic upgrade head
+docker compose ps
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/ready
 ```
 
-Повторный запуск пропускает заполненные строки. После backfill можно отдельной
-будущей миграцией провалидировать CHECK и установить обычный NOT NULL.
+API image использует `python:3.12-slim`, только runtime dependencies и пользователя
+`appuser` (UID 10001). HEALTHCHECK обращается к `/health` через Python stdlib.
+Модель не скачивается при build: она загружается при startup в доступный пользователю
+cache (`HF_HOME` можно переопределить). Первый запуск может быть долгим; cache
+в контейнере теряется при его пересоздании, отдельного model volume пока нет.
 
-## Real embedding smoke test (manual)
+Compose сохраняет PostgreSQL в именованном volume, ждёт его healthcheck и использует
+`restart: unless-stopped`. Source code bind mount отсутствует. API публикуется на
+8000, PostgreSQL — на 55432. Это конфигурация для разработки с dev credentials.
 
-Не является частью pytest. В активированном окружении откройте `python` и выполните:
+`.env` не попадает в image. Для ручного анализа через Docker экспортируйте LLM
+variables в окружение хоста и явно передайте их контейнеру:
 
-```python
-import asyncio
-from app.core.config import Settings
-from app.services.embedding_service import EmbeddingService
-
-async def smoke():
-    settings = Settings()
-    service = EmbeddingService(settings.embedding_model_name, settings.embedding_dimension)
-    await service.load_model()
-    vector = await service.embed_text("multiple failed ssh login attempts")
-    assert len(vector) == 384
-    print(f"Embedding dimension: {len(vector)}")
-
-asyncio.run(smoke())
+```sh
+docker compose stop api
+docker compose run --rm --service-ports -e LLM_API_KEY -e LLM_BASE_URL -e LLM_MODEL api
 ```
 
-При первой загрузке нужны сеть и доступ к Hugging Face; ошибка загрузки здесь
-не должна влиять на обычные unit/API-тесты с fake model. NumPy приходит транзитивно,
-прямого импорта и прямой зависимости на NumPy в проекте нет.
+Показанная команда предполагает, что все три переменные заданы. Внутренний
+`DATABASE_URL` остаётся `postgres:5432`. Секреты не записываются в Compose.
 
-## Planned features
+## CI
 
-- Оценка качества retrieval и анализа на размеченных SOC-инцидентах
+GitHub Actions настроен в `.github/workflows/ci.yml`: запускается при `push`,
+`pull_request` и вручную через `workflow_dispatch`. После успешного `lint`
+параллельно выполняются `unit` и `integration`. Workflow имеет только
+`contents: read`, ограничение времени jobs и кеш pip по `pyproject.toml`.
+
+GitLab CI настроен отдельно в `.gitlab-ci.yml` со stages `lint` и `test`.
+Обе конфигурации выполняют одинаковые проверки:
+
+| Job | Проверки |
+| --- | --- |
+| `lint` | Ruff и `mypy app` |
+| `unit` | `pytest -m "not integration" -v`, без PostgreSQL |
+| `integration` | Миграции до head, затем `pytest -m integration -v` |
+
+Каждый job использует `python:3.12-slim` и устанавливает `.[dev]`. Integration job
+поднимает service `pgvector/pgvector:pg17` с alias `postgres`, БД
+`soc_assistant_test` и одноразовыми credentials `postgres:postgres`.
+`TEST_DATABASE_URL` использует `postgres:5432`; только команда Alembic временно
+получает этот URL как `DATABASE_URL`, сохраняя защиту тестовой БД в pytest.
+
+Кешируется только pip cache. `HF_HUB_OFFLINE=1` и `TRANSFORMERS_OFFLINE=1` запрещают
+загрузку моделей; тесты используют mocks/manual vectors. LLM key не требуется.
+В GitHub jobs работают в контейнере Python на `ubuntu-24.04`, поэтому PostgreSQL
+доступен по имени service `postgres`, без публикации порта на runner.
+Для GitLab нужен Runner с поддержкой container services. Deploy jobs отсутствуют.
+Настройка services описана в документации
+[GitHub Actions](https://docs.github.com/en/actions/tutorials/use-containerized-services/create-postgresql-service-containers)
+и [GitLab](https://docs.gitlab.com/ci/services/postgres/).
+
+CI config created and locally validated where possible. Реальный pipeline нужно
+подтвердить запуском в GitHub/GitLab; локальные проверки не заменяют этот запуск.
+
+## Configuration
+
+`pydantic-settings` читает `.env` из текущей директории; environment variables имеют
+приоритет. После изменения конфигурации перезапустите API.
+
+| Variable | Default / поведение |
+| --- | --- |
+| `APP_NAME` | `SOC Incident Assistant` |
+| `APP_ENV` | `development`; допустимы `development`, `test`, `production` |
+| `LOG_LEVEL` | `INFO`; допустимы `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
+| `DATABASE_URL` | Host URL из таблицы выше; в production задаётся явно |
+| `TEST_DATABASE_URL` | Не задан; включает integration tests |
+| `EMBEDDING_MODEL_NAME` | `sentence-transformers/all-MiniLM-L6-v2` |
+| `EMBEDDING_DIMENSION` | `384`, должна совпадать с моделью и схемой |
+| `LLM_BASE_URL` | `https://api.openai.com/v1`, валидный HTTP(S) URL |
+| `LLM_MODEL` | `gpt-4.1-mini`, непустая строка |
+| `LLM_API_KEY` | Не задан; не обязателен при startup |
+| `LLM_TIMEOUT_SECONDS` | `30`, положительный HTTP timeout для операций httpx |
+| `RAG_MAX_CONTEXT_CHARS` | `12000`, минимум 1, включая заголовки документов |
+
+При `APP_ENV=production` отсутствие явно заданного `DATABASE_URL` вызывает ошибку
+валидации до создания engine и загрузки модели. `.env` считается явной конфигурацией.
+Пустые DATABASE_URL/LLM_MODEL и некорректный LLM_BASE_URL отклоняются также в development.
+Это минимальная валидация, а не гарантия готовности к публичному production.
+`.env` игнорируется Git; `.env.example` содержит только примеры и пустой LLM key.
+
+Logging настраивается в lifespan, а не при импорте или `create_app()`.
+Стандартный logging выводит timestamp, level, logger и message.
+Request log содержит method, path, status, duration_ms и request_id. Тела, query
+strings, Authorization, векторы и provider responses не логируются. Стандартный
+Uvicorn access log отключён, чтобы не дублировать URL с query strings; HTTP client
+logging ограничен уровнем WARNING. Неожиданные ошибки логируются без текста
+исключения, который может содержать SQL values или credentials.
+
+## Design decisions
+
+- Простая orchestration вместо LangChain: retrieval, prompt и provider call видны
+  напрямую и тестируются отдельно; дополнительные frameworks здесь не нужны.
+- `asyncio.to_thread` выносит model loading и encode из event loop; одна модель
+  переиспользуется в lifespan. Это не batching и не очередь inference.
+- `httpx.AsyncClient` переиспользует соединения и даёт явные timeout/error handling
+  без provider SDK. Automatic retries отсутствуют, чтобы не повторять платные вызовы.
+- Application-owned sources связывают ответ с реально переданным контекстом.
+- Fake embeddings и LLM в тестах делают проверки воспроизводимыми без сети и оплаты.
+- pgvector хранит документы и векторы в PostgreSQL, без отдельной vector database.
+- mypy проверяет аннотации приложения без максимального strict и массовых ignore.
+
+## Limitations / planned improvements
+
+- Нет auth, rate limiting, reranking, hybrid search и vector indexes; текущий поиск
+  рассчитан на небольшой dataset.
+- Нет automatic retries, conversational memory и истории анализов.
+- Нет similarity threshold: top-k может содержать нерелевантные документы.
+- JSON validation проверяет структуру, но не достоверность выводов модели.
+- Startup требует доступной embedding model/cache; readiness проверяет только БД.
+- Версии зависимостей ограничены диапазонами, отдельного lockfile пока нет.
+- Возможное продолжение: размеченный evaluation dataset для оценки retrieval и анализа.
+
+## What this project demonstrates
+
+- Python async backend development и REST API design.
+- PostgreSQL / SQLAlchemy, миграции и управление транзакциями.
+- Semantic/vector retrieval и практическую RAG architecture.
+- LLM API integration с валидируемым структурированным ответом.
+- Unit/integration testing и static/type checks.
+- Docker, lifecycle ресурсов, health/readiness и безопасные request logs.
+- Основы CI/CD: автоматические проверки в GitHub Actions и GitLab CI (без deployment).

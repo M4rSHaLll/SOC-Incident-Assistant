@@ -1,8 +1,8 @@
 """Settings loaded from environment variables and an optional .env file."""
 
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import Field
+from pydantic import AnyHttpUrl, Field, TypeAdapter, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 EMBEDDING_DIMENSION = 384
@@ -28,4 +28,24 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        hide_input_in_errors=True,
     )
+
+    @field_validator("llm_base_url")
+    @classmethod
+    def validate_llm_base_url(cls, value: str) -> str:
+        TypeAdapter(AnyHttpUrl).validate_python(value)
+        return value
+
+    @field_validator("llm_model", "database_url")
+    @classmethod
+    def validate_nonempty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Must not be empty")
+        return value.strip()
+
+    @model_validator(mode="after")
+    def validate_production(self) -> Self:
+        if self.app_env == "production" and "database_url" not in self.model_fields_set:
+            raise ValueError("DATABASE_URL must be explicitly set in production")
+        return self

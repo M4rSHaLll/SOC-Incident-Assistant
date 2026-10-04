@@ -9,8 +9,10 @@ from fastapi import FastAPI
 from app.api.analysis import router as analysis_router
 from app.api.documents import router as documents_router
 from app.api.health import router as health_router
+from app.api.middleware import log_request
 from app.api.search import router as search_router
 from app.core.config import Settings
+from app.core.logging import configure_logging
 from app.db.database import create_database
 from app.services.embedding_service import EmbeddingService
 from app.services.llm_service import LLMService
@@ -21,6 +23,7 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        configure_logging(settings.log_level)
         engine, session_factory = create_database(settings.database_url)
         app.state.db_session_factory = session_factory
         try:
@@ -46,6 +49,7 @@ def create_app() -> FastAPI:
             await engine.dispose()
 
     app = FastAPI(title=settings.app_name, lifespan=lifespan)
+    app.middleware("http")(log_request)
     app.include_router(health_router)
     app.include_router(documents_router)
     app.include_router(search_router)
